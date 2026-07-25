@@ -132,22 +132,61 @@ impl PeerMap {
         register_pk_response::Result::OK
     }
 
+    pub(crate) async fn rename_peer(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        uuid: &Bytes,
+    ) -> register_pk_response::Result {
+        let mut peers = self.map.write().await;
+        if old_id != new_id {
+            if let Some(existing) = peers.get(new_id) {
+                let existing_uuid = existing.read().await.uuid.clone();
+                if existing_uuid.is_empty() || existing_uuid != *uuid {
+                    return register_pk_response::Result::ID_EXISTS;
+                }
+            }
+        }
+
+        match self.db.rename_peer(old_id, new_id, uuid).await {
+            Ok(database::RenamePeerResult::Renamed) => {
+                if old_id != new_id {
+                    if let Some(peer) = peers.remove(old_id) {
+                        peers.insert(new_id.to_owned(), peer);
+                    } else if !peers.contains_key(new_id) {
+                        match self.db.get_peer(new_id).await {
+                            Ok(Some(peer)) => {
+                                peers.insert(new_id.to_owned(), Arc::new(RwLock::new(peer.into())));
+                            }
+                            Ok(None) => return register_pk_response::Result::SERVER_ERROR,
+                            Err(err) => {
+                                log::error!("db.get_peer after rename failed: {}", err);
+                                return register_pk_response::Result::SERVER_ERROR;
+                            }
+                        }
+                    }
+                }
+                register_pk_response::Result::OK
+            }
+            Ok(database::RenamePeerResult::IdExists) => register_pk_response::Result::ID_EXISTS,
+            Ok(database::RenamePeerResult::OldIdNotFound)
+            | Ok(database::RenamePeerResult::UuidMismatch) => {
+                register_pk_response::Result::UUID_MISMATCH
+            }
+            Err(err) => {
+                log::error!("db.rename_peer failed: {}", err);
+                register_pk_response::Result::SERVER_ERROR
+            }
+        }
+    }
+
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
         let p = self.map.read().await.get(id).cloned();
         if p.is_some() {
             return p;
         } else if let Ok(Some(v)) = self.db.get_peer(id).await {
-            let peer = Peer {
-                guid: v.guid,
-                uuid: v.uuid.into(),
-                pk: v.pk.into(),
-                // user: v.user,
-                info: serde_json::from_str::<PeerInfo>(&v.info).unwrap_or_default(),
-                // disabled: v.status == Some(0),
-                ..Default::default()
-            };
-            let peer = Arc::new(RwLock::new(peer));
+            let peer = Arc::new(RwLock::new(v.into()));
             self.map.write().await.insert(id.to_owned(), peer.clone());
             return Some(peer);
         }
@@ -176,5 +215,167 @@ impl PeerMap {
     #[inline]
     pub(crate) async fn is_in_memory(&self, id: &str) -> bool {
         self.map.read().await.contains_key(id)
+    }
+}
+
+impl From<database::Peer> for Peer {
+    fn from(peer: database::Peer) -> Self {
+        Self {
+            guid: peer.guid,
+            uuid: peer.uuid.into(),
+            pk: peer.pk.into(),
+            info: serde_json::from_str::<PeerInfo>(&peer.info).unwrap_or_default(),
+            ..Default::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LockPeer, PeerMap};
+    use crate::database::Database;
+    use hbb_common::{bytes::Bytes, rendezvous_proto::register_pk_response::Result, tokio};
+    use std::{path::PathBuf, sync::Arc};
+
+    fn test_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rustdesk-server-peer-map-{name}-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    async fn peer_map_with_peer(path: &PathBuf, id: &str, uuid: &[u8]) -> PeerMap {
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        db.insert_peer(id, uuid, b"peer-public-key", r#"{"ip":"10.0.0.1"}"#)
+            .await
+            .unwrap();
+        PeerMap {
+            map: Default::default(),
+            db,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_moves_same_live_peer_to_new_id() {
+        let path = test_db_path("moves-live-peer");
+        let pm = peer_map_with_peer(&path, "123456789", b"device-uuid").await;
+        let old_peer = pm.get("123456789").await.unwrap();
+
+        let result = pm
+            .rename_peer(
+                "123456789",
+                "farm-pc01",
+                &Bytes::from_static(b"device-uuid"),
+            )
+            .await;
+
+        assert_eq!(result, Result::OK);
+        assert!(pm.get_in_memory("123456789").await.is_none());
+        let new_peer = pm.get_in_memory("farm-pc01").await.unwrap();
+        assert!(Arc::ptr_eq(&old_peer, &new_peer));
+        assert!(pm.db.get_peer("123456789").await.unwrap().is_none());
+        assert!(pm.db.get_peer("farm-pc01").await.unwrap().is_some());
+        drop(pm);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_rejects_in_memory_id_conflict() {
+        let path = test_db_path("in-memory-conflict");
+        let pm = peer_map_with_peer(&path, "123456789", b"source-uuid").await;
+        let conflicting_peer = LockPeer::default();
+        conflicting_peer.write().await.uuid = Bytes::from_static(b"target-uuid");
+        pm.map
+            .write()
+            .await
+            .insert("farm-pc01".to_owned(), conflicting_peer);
+
+        let result = pm
+            .rename_peer(
+                "123456789",
+                "farm-pc01",
+                &Bytes::from_static(b"source-uuid"),
+            )
+            .await;
+
+        assert_eq!(result, Result::ID_EXISTS);
+        assert!(pm.get_in_memory("123456789").await.is_none());
+        assert!(pm.db.get_peer("123456789").await.unwrap().is_some());
+        assert!(pm.db.get_peer("farm-pc01").await.unwrap().is_none());
+        drop(pm);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_maps_uuid_mismatch() {
+        let path = test_db_path("uuid-mismatch");
+        let pm = peer_map_with_peer(&path, "123456789", b"owner-uuid").await;
+
+        let result = pm
+            .rename_peer(
+                "123456789",
+                "farm-pc01",
+                &Bytes::from_static(b"different-uuid"),
+            )
+            .await;
+
+        assert_eq!(result, Result::UUID_MISMATCH);
+        assert!(pm.db.get_peer("123456789").await.unwrap().is_some());
+        drop(pm);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_retry_is_idempotent() {
+        let path = test_db_path("idempotent-retry");
+        let pm = peer_map_with_peer(&path, "123456789", b"device-uuid").await;
+        let uuid = Bytes::from_static(b"device-uuid");
+
+        assert_eq!(
+            pm.rename_peer("123456789", "farm-pc01", &uuid).await,
+            Result::OK
+        );
+        assert_eq!(
+            pm.rename_peer("123456789", "farm-pc01", &uuid).await,
+            Result::OK
+        );
+        assert!(pm.get_in_memory("123456789").await.is_none());
+        assert!(pm.get_in_memory("farm-pc01").await.is_some());
+        drop(pm);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_renames_allow_only_one_owner() {
+        let path = test_db_path("concurrent-renames");
+        let pm = peer_map_with_peer(&path, "123456789", b"first-uuid").await;
+        pm.db
+            .insert_peer(
+                "987654321",
+                b"second-uuid",
+                b"second-public-key",
+                r#"{"ip":"10.0.0.2"}"#,
+            )
+            .await
+            .unwrap();
+
+        let first_uuid = Bytes::from_static(b"first-uuid");
+        let second_uuid = Bytes::from_static(b"second-uuid");
+        let (first, second) = tokio::join!(
+            pm.rename_peer("123456789", "farm-pc01", &first_uuid),
+            pm.rename_peer("987654321", "farm-pc01", &second_uuid)
+        );
+
+        assert!(
+            (first == Result::OK && second == Result::ID_EXISTS)
+                || (first == Result::ID_EXISTS && second == Result::OK)
+        );
+        let winner = pm.db.get_peer("farm-pc01").await.unwrap().unwrap();
+        assert!(winner.uuid == b"first-uuid" || winner.uuid == b"second-uuid");
+        let remaining_sources = pm.db.get_peer("123456789").await.unwrap().is_some() as u8
+            + pm.db.get_peer("987654321").await.unwrap().is_some() as u8;
+        assert_eq!(remaining_sources, 1);
+        drop(pm);
+        std::fs::remove_file(path).unwrap();
     }
 }

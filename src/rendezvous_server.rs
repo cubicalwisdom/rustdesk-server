@@ -97,6 +97,18 @@ enum LoopFailure {
     Listener,
 }
 
+fn validate_rename_request(rk: &RegisterPk) -> register_pk_response::Result {
+    if rk.old_id.is_empty() {
+        register_pk_response::Result::NOT_SUPPORT
+    } else if rk.uuid.is_empty() {
+        register_pk_response::Result::UUID_MISMATCH
+    } else if !hbb_common::is_valid_custom_id(&rk.id) {
+        register_pk_response::Result::INVALID_ID_FORMAT
+    } else {
+        register_pk_response::Result::OK
+    }
+}
+
 impl RendezvousServer {
     #[tokio::main(flavor = "multi_thread")]
     pub async fn start(port: i32, serial: i32, key: &str, rmem: usize) -> ResultType<()> {
@@ -545,8 +557,16 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    let mut res = validate_rename_request(&rk);
+                    if res == register_pk_response::Result::OK {
+                        let ip = addr.ip().to_string();
+                        if !self.check_ip_blocker(&ip, &rk.id).await {
+                            res = register_pk_response::Result::TOO_FREQUENT;
+                        } else {
+                            res = self.pm.rename_peer(&rk.old_id, &rk.id, &rk.uuid).await;
+                        }
+                    }
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: res.into(),
@@ -1360,4 +1380,58 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_rename_request;
+    use hbb_common::{
+        bytes::Bytes,
+        rendezvous_proto::{register_pk_response::Result, RegisterPk},
+    };
+
+    fn rename_request(old_id: &str, new_id: &str, uuid: &'static [u8]) -> RegisterPk {
+        RegisterPk {
+            old_id: old_id.to_owned(),
+            id: new_id.to_owned(),
+            uuid: Bytes::from_static(uuid),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_rename_request_preserves_non_rename_not_support() {
+        let request = rename_request("", "farm-pc01", b"device-uuid");
+        assert_eq!(validate_rename_request(&request), Result::NOT_SUPPORT);
+    }
+
+    #[test]
+    fn test_validate_rename_request_rejects_empty_uuid() {
+        let request = rename_request("123456789", "farm-pc01", b"");
+        assert_eq!(validate_rename_request(&request), Result::UUID_MISMATCH);
+    }
+
+    #[test]
+    fn test_validate_rename_request_rejects_invalid_id() {
+        for id in ["farm", "1farm-pc", "farm@pc01", "farm pc01"] {
+            let request = rename_request("123456789", id, b"device-uuid");
+            assert_eq!(
+                validate_rename_request(&request),
+                Result::INVALID_ID_FORMAT,
+                "{id} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_rename_request_accepts_official_id() {
+        for id in ["farm01", "farm-pc01", "workshop_01"] {
+            let request = rename_request("123456789", id, b"device-uuid");
+            assert_eq!(
+                validate_rename_request(&request),
+                Result::OK,
+                "{id} must be accepted"
+            );
+        }
+    }
 }
