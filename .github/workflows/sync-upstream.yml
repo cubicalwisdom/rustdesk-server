@@ -1,0 +1,33 @@
+name: Sync Upstream Master
+
+on:
+  schedule:
+    - cron: "23 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream-master
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out fork master
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Fast-forward from official upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/rustdesk/rustdesk-server.git
+          git fetch --prune --tags upstream master
+          git merge --ff-only upstream/master
+          git push origin master
+
