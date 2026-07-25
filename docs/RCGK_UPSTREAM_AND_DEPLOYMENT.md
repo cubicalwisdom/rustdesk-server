@@ -43,6 +43,25 @@ Resolve conflicts on the upgrade branch, run the verification workflow, and merg
 5. Verify DNS, TCP 21115-21117, UDP 21116, identity continuity, database access, registration, and relay behavior.
 6. If verification fails, restore the old Compose file, old image digest, and complete pre-cutover state directory.
 
+## RCGK custom IDs
+
+The RCGK `hbbs` build accepts the stock RustDesk client's official Change ID request. It renames an existing peer only when the request's old ID and machine UUID match the stored peer, and it rejects names already owned by another peer.
+
+Custom IDs must use the official client format:
+
+- 6-16 characters.
+- Start with an ASCII letter.
+- Use only letters, digits, `_`, or `-` after the first character.
+- Do not use spaces, dots, or `@`.
+
+On an installed client, unlock **Settings > Security** and use **Change ID**. On Windows, the equivalent administrator PowerShell command is:
+
+```powershell
+& "$env:ProgramFiles\RustDesk\rustdesk.exe" --set-id "farm-pc01" | Out-String
+```
+
+The client must be online against the RCGK ID server while changing its ID. The old numeric ID stops resolving after a successful rename. Device UUID, public key, password, approval settings, and the remaining peer database fields are preserved. Back up a pilot client's configuration before its first rename because the official Change ID form does not accept a numeric ID for a direct rename back.
+
 ## Current deployment record
 
 - Cutover date: 2026-07-25

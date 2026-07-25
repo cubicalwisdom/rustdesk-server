@@ -46,6 +46,24 @@ pub struct Peer {
     pub status: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenamePeerResult {
+    Renamed,
+    OldIdNotFound,
+    UuidMismatch,
+    IdExists,
+}
+
+fn is_peer_id_unique_violation(err: &SqlxError) -> bool {
+    match err {
+        SqlxError::Database(err) => {
+            err.code().as_deref() == Some("2067")
+                || err.message().contains("UNIQUE constraint failed: peer.id")
+        }
+        _ => false,
+    }
+}
+
 impl Database {
     pub async fn new(url: &str) -> ResultType<Database> {
         if !std::path::Path::new(url).exists() {
@@ -142,11 +160,70 @@ impl Database {
         .await?;
         Ok(())
     }
+
+    pub(crate) async fn rename_peer(
+        &self,
+        old_id: &str,
+        new_id: &str,
+        uuid: &[u8],
+    ) -> ResultType<RenamePeerResult> {
+        let mut conn = self.pool.get().await?;
+        let update = sqlx::query("update peer set id=? where id=? and uuid=?")
+            .bind(new_id)
+            .bind(old_id)
+            .bind(uuid)
+            .execute(conn.deref_mut())
+            .await;
+
+        match update {
+            Ok(result) if result.rows_affected() == 1 => Ok(RenamePeerResult::Renamed),
+            Err(err) if is_peer_id_unique_violation(&err) => Ok(RenamePeerResult::IdExists),
+            Err(err) => Err(err.into()),
+            Ok(_) => {
+                let old_uuid: Option<Vec<u8>> =
+                    sqlx::query_scalar("select uuid from peer where id=?")
+                        .bind(old_id)
+                        .fetch_optional(conn.deref_mut())
+                        .await?;
+                if old_uuid.is_some() {
+                    return Ok(RenamePeerResult::UuidMismatch);
+                }
+
+                let new_uuid: Option<Vec<u8>> =
+                    sqlx::query_scalar("select uuid from peer where id=?")
+                        .bind(new_id)
+                        .fetch_optional(conn.deref_mut())
+                        .await?;
+                match new_uuid {
+                    Some(stored_uuid) if stored_uuid == uuid => Ok(RenamePeerResult::Renamed),
+                    Some(_) => Ok(RenamePeerResult::IdExists),
+                    None => Ok(RenamePeerResult::OldIdNotFound),
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{Database, RenamePeerResult};
     use hbb_common::tokio;
+    use sqlx::Row;
+    use std::{ops::DerefMut, path::PathBuf};
+
+    fn test_db_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "rustdesk-server-{name}-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    async fn insert_test_peer(db: &Database, id: &str, uuid: &[u8]) {
+        db.insert_peer(id, uuid, b"peer-public-key", r#"{"ip":"10.0.0.1"}"#)
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn test_insert() {
         insert();
@@ -177,5 +254,130 @@ mod tests {
             jobs.push(a);
         }
         hbb_common::futures::future::join_all(jobs).await;
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_preserves_peer_fields() {
+        let path = test_db_path("rename-preserves-fields");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        let old_id = "123456789";
+        let new_id = "farm-pc01";
+        let uuid = b"device-uuid";
+        insert_test_peer(&db, old_id, uuid).await;
+
+        let mut conn = db.pool.get().await.unwrap();
+        sqlx::query("update peer set user=?, status=?, note=? where id=?")
+            .bind(b"workshop".as_slice())
+            .bind(0_i64)
+            .bind("primary farm computer")
+            .bind(old_id)
+            .execute(conn.deref_mut())
+            .await
+            .unwrap();
+        let created_at: String = sqlx::query_scalar("select created_at from peer where id=?")
+            .bind(old_id)
+            .fetch_one(conn.deref_mut())
+            .await
+            .unwrap();
+        drop(conn);
+
+        let result = db.rename_peer(old_id, new_id, uuid).await.unwrap();
+
+        assert_eq!(result, RenamePeerResult::Renamed);
+        assert!(db.get_peer(old_id).await.unwrap().is_none());
+        let peer = db.get_peer(new_id).await.unwrap().unwrap();
+        assert_eq!(peer.uuid, uuid);
+        assert_eq!(peer.pk, b"peer-public-key");
+        assert_eq!(peer.user, Some(b"workshop".to_vec()));
+        assert_eq!(peer.status, Some(0));
+        assert_eq!(peer.info, r#"{"ip":"10.0.0.1"}"#);
+
+        let mut conn = db.pool.get().await.unwrap();
+        let row = sqlx::query("select created_at, note from peer where id=?")
+            .bind(new_id)
+            .fetch_one(conn.deref_mut())
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String, _>("created_at"), created_at);
+        assert_eq!(row.get::<String, _>("note"), "primary farm computer");
+        drop(conn);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_rejects_uuid_mismatch() {
+        let path = test_db_path("rename-uuid-mismatch");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        insert_test_peer(&db, "123456789", b"owner-uuid").await;
+
+        let result = db
+            .rename_peer("123456789", "farm-pc01", b"different-uuid")
+            .await
+            .unwrap();
+
+        assert_eq!(result, RenamePeerResult::UuidMismatch);
+        assert!(db.get_peer("123456789").await.unwrap().is_some());
+        assert!(db.get_peer("farm-pc01").await.unwrap().is_none());
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_rejects_duplicate_id() {
+        let path = test_db_path("rename-duplicate");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        insert_test_peer(&db, "123456789", b"source-uuid").await;
+        insert_test_peer(&db, "farm-pc01", b"target-uuid").await;
+
+        let result = db
+            .rename_peer("123456789", "farm-pc01", b"source-uuid")
+            .await
+            .unwrap();
+
+        assert_eq!(result, RenamePeerResult::IdExists);
+        assert!(db.get_peer("123456789").await.unwrap().is_some());
+        let target = db.get_peer("farm-pc01").await.unwrap().unwrap();
+        assert_eq!(target.uuid, b"target-uuid");
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_is_idempotent_after_success() {
+        let path = test_db_path("rename-idempotent");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+        let uuid = b"device-uuid";
+        insert_test_peer(&db, "123456789", uuid).await;
+
+        assert_eq!(
+            db.rename_peer("123456789", "farm-pc01", uuid)
+                .await
+                .unwrap(),
+            RenamePeerResult::Renamed
+        );
+        assert_eq!(
+            db.rename_peer("123456789", "farm-pc01", uuid)
+                .await
+                .unwrap(),
+            RenamePeerResult::Renamed
+        );
+        drop(db);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rename_peer_reports_missing_old_id() {
+        let path = test_db_path("rename-missing-old-id");
+        let db = Database::new(path.to_str().unwrap()).await.unwrap();
+
+        let result = db
+            .rename_peer("123456789", "farm-pc01", b"device-uuid")
+            .await
+            .unwrap();
+
+        assert_eq!(result, RenamePeerResult::OldIdNotFound);
+        drop(db);
+        std::fs::remove_file(path).unwrap();
     }
 }
