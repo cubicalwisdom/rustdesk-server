@@ -64,13 +64,16 @@ The client must be online against the RCGK ID server while changing its ID. The 
 
 ## Current deployment record
 
-- Cutover date: 2026-07-25
+- Custom-ID cutover date: 2026-07-26 (Asia/Calcutta; 2026-07-25 UTC)
 - Source branch: `rcgk-server`
-- Source commit: `8724361cbd683b90be818905fe4f1381cf9f6d08`
+- Source commit: `ed643bf8b4e22818a2aab464d39b9e395721ec06`
 - Upstream baseline: `1.1.16` (`73523b31cfd25d77dee862e6fc9f5e1fb5e485ef`)
-- Deployed image: `ghcr.io/cubicalwisdom/rustdesk-server@sha256:c8abc1e853794b9698ac650ca3ce27dd39a72c1ee6a009815e3e0db8b813438a`
-- OCI backup: `/opt/stacks/backups/rustdesk-20260725T175337Z`
+- Release tag: `1.1.16-rcgk.3-arm64`
+- Deployed image: `ghcr.io/cubicalwisdom/rustdesk-server@sha256:44c499c6e6fd0ddf181ae7a0834bd70bf74d111118729011a5a270318c7a0088`
+- Previous image: `ghcr.io/cubicalwisdom/rustdesk-server@sha256:c8abc1e853794b9698ac650ca3ce27dd39a72c1ee6a009815e3e0db8b813438a`
+- Pre-cutover OCI backup: `/opt/stacks/backups/rustdesk-20260725T234651Z-custom-id`
 - Compose path: `/opt/stacks/rustdesk-compose.yml`
 - Persistent state: `/opt/stacks/data:/root`
+- Verification: both containers running with zero restarts; required TCP/UDP listeners present; external TCP 21115-21117 reachable; identity hash unchanged; live and backup SQLite `quick_check` results `ok` with three peer rows each.
 
-The first RCGK image is behavior-compatible with upstream 1.1.16 and establishes the controlled build and deployment path. Add server features as isolated, tested commits on `feature/<name>` branches.
+The current RCGK image is compatible with the existing 1.1.16 deployment and adds only the stock-client Change ID handler described above. Add future server features as isolated, tested commits on `feature/<name>` branches.
