@@ -43,3 +43,15 @@ Resolve conflicts on the upgrade branch, run the verification workflow, and merg
 5. Verify DNS, TCP 21115-21117, UDP 21116, identity continuity, database access, registration, and relay behavior.
 6. If verification fails, restore the old Compose file, old image digest, and complete pre-cutover state directory.
 
+## Current deployment record
+
+- Cutover date: 2026-07-25
+- Source branch: `rcgk-server`
+- Source commit: `8724361cbd683b90be818905fe4f1381cf9f6d08`
+- Upstream baseline: `1.1.16` (`73523b31cfd25d77dee862e6fc9f5e1fb5e485ef`)
+- Deployed image: `ghcr.io/cubicalwisdom/rustdesk-server@sha256:c8abc1e853794b9698ac650ca3ce27dd39a72c1ee6a009815e3e0db8b813438a`
+- OCI backup: `/opt/stacks/backups/rustdesk-20260725T175337Z`
+- Compose path: `/opt/stacks/rustdesk-compose.yml`
+- Persistent state: `/opt/stacks/data:/root`
+
+The first RCGK image is behavior-compatible with upstream 1.1.16 and establishes the controlled build and deployment path. Add server features as isolated, tested commits on `feature/<name>` branches.
