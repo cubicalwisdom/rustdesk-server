@@ -75,5 +75,6 @@ The client must be online against the RCGK ID server while changing its ID. The 
 - Compose path: `/opt/stacks/rustdesk-compose.yml`
 - Persistent state: `/opt/stacks/data:/root`
 - Verification: both containers running with zero restarts; required TCP/UDP listeners present; external TCP 21115-21117 reachable; identity hash unchanged; live and backup SQLite `quick_check` results `ok` with three peer rows each.
+- Pilot client: Windows RustDesk 1.4.9 successfully changed its numeric ID to `rcpc-rc`; the client reports the new ID, the server contains one valid `rcpc-rc` peer row, the total peer count stayed at three, and the live database still passes `quick_check`.
 
 The current RCGK image is compatible with the existing 1.1.16 deployment and adds only the stock-client Change ID handler described above. Add future server features as isolated, tested commits on `feature/<name>` branches.
